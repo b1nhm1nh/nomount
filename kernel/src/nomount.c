@@ -1520,8 +1520,25 @@ static int nm_process_payload(unsigned long user_addr)
     }
 
     payload->status = 0;
-    buf_ptr = payload->buffer + payload->arg1;
-    buf_end = payload->buffer + (payload->data_size > sizeof(payload->buffer) ? sizeof(payload->buffer) : payload->data_size);
+
+    /*
+     * payload lives in a page shared with userspace, so every field is
+     * attacker-controlled and can change under us. Read the offset and length
+     * once, and clamp both to the buffer before deriving any pointer:
+     * an unclamped arg1 put buf_ptr past buf_end, and the (buf_end - buf_ptr)
+     * differences below then wrapped to a huge size_t, walking off the page.
+     */
+    {
+        u32 off = READ_ONCE(payload->arg1);
+        u32 len = READ_ONCE(payload->data_size);
+
+        if (off > sizeof(payload->buffer)) off = sizeof(payload->buffer);
+        if (len > sizeof(payload->buffer)) len = sizeof(payload->buffer);
+        if (off > len) off = len;
+
+        buf_ptr = payload->buffer + off;
+        buf_end = payload->buffer + len;
+    }
 
     switch (payload->cmd) {
         case NM_CMD_GET_VERSION:
@@ -1533,10 +1550,21 @@ static int nm_process_payload(unsigned long user_addr)
             if (payload->data_size > sizeof(payload->buffer)) { payload->status = -EINVAL; break; }
             while ((size_t)(buf_end - buf_ptr) >= sizeof(struct nm_rule_hdr)) {
                 struct nm_rule_hdr *h = (void *)buf_ptr;
+                /*
+                 * Copy the header out of the shared page before validating it.
+                 * Re-reading h->v_len/h->r_len after the bounds check let a
+                 * second thread enlarge them in between (double fetch), so the
+                 * copy below ran past buf_end.
+                 */
+                struct nm_rule_hdr hdr;
+
+                memcpy(&hdr, h, sizeof(hdr));
+
                 buf_ptr += sizeof(*h);
-                if ((h->v_len + h->r_len) > (size_t)(buf_end - buf_ptr) || unlikely(h->v_len >= PATH_MAX || h->r_len >= PATH_MAX)) break;
-                payload->status = __nomount_add_rule(buf_ptr, buf_ptr + h->v_len, h->v_len, h->r_len, h->flags, h->uid, &r_victims);
-                buf_ptr += (size_t)(h->v_len + h->r_len);
+                if ((size_t)hdr.v_len + hdr.r_len > (size_t)(buf_end - buf_ptr) ||
+                    unlikely(hdr.v_len >= PATH_MAX || hdr.r_len >= PATH_MAX)) break;
+                payload->status = __nomount_add_rule(buf_ptr, buf_ptr + hdr.v_len, hdr.v_len, hdr.r_len, hdr.flags, hdr.uid, &r_victims);
+                buf_ptr += (size_t)hdr.v_len + hdr.r_len;
             }
             payload->arg1 = buf_ptr - payload->buffer;
 
@@ -1557,10 +1585,15 @@ static int nm_process_payload(unsigned long user_addr)
             mutex_lock(&nomount_mutex);
             while ((size_t)(buf_end - buf_ptr) >= sizeof(struct nm_del_hdr)) {
                 struct nm_del_hdr *h = (void *)buf_ptr;
+                /* Snapshot before validating: see the NM_CMD_ADD_RULE comment. */
+                struct nm_del_hdr hdr;
+
+                memcpy(&hdr, h, sizeof(hdr));
+
                 buf_ptr += sizeof(*h);
-                if (h->v_len > (size_t)(buf_end - buf_ptr)) break;
-                __nomount_del_rule(buf_ptr, h->v_len, h->uid, &r_victims);
-                buf_ptr += h->v_len;
+                if ((size_t)hdr.v_len > (size_t)(buf_end - buf_ptr)) break;
+                __nomount_del_rule(buf_ptr, hdr.v_len, hdr.uid, &r_victims);
+                buf_ptr += hdr.v_len;
             }
             mutex_unlock(&nomount_mutex);
             payload->arg1 = buf_ptr - payload->buffer;
@@ -1608,7 +1641,8 @@ static int nm_process_payload(unsigned long user_addr)
             break;
 
         case NM_CMD_GET_LIST: {
-            int current_idx = 0;
+            /* unsigned: compared against arg1 (u32) below */
+            u32 current_idx = 0, start_idx = READ_ONCE(payload->arg1);
             int bkt;
             buf_ptr = payload->buffer;
             buf_end = payload->buffer + sizeof(payload->buffer);
@@ -1616,7 +1650,7 @@ static int nm_process_payload(unsigned long user_addr)
             rcu_read_lock();
             struct nomount_rule *r;
             hash_for_each_rcu(nomount_rules_ht, bkt, r, ht_node) {
-                if (current_idx++ < payload->arg1) continue;
+                if (current_idx++ < start_idx) continue;
                 if ((sizeof(struct nm_rule_hdr) + r->v_len + r->r_len) > (size_t)(buf_end - buf_ptr)) { current_idx--; break; }
 
                 *(struct nm_rule_hdr *)buf_ptr = (struct nm_rule_hdr){.flags = r->flags, .uid = r->target_uid, .v_len = r->v_len, .r_len = r->r_len};
@@ -1632,11 +1666,19 @@ static int nm_process_payload(unsigned long user_addr)
 
         case NM_CMD_GET_UIDS: {
             u32 *out = (u32 *)payload->buffer;
-            int count = 0, start_idx = payload->arg1;
+            /*
+             * start_idx was a signed int taken straight from userspace: a
+             * negative value passed the `start_idx < arr->count` test and
+             * indexed before arr->uids, leaking kernel heap to the caller.
+             */
+            u32 count = 0, start_idx = READ_ONCE(payload->arg1);
             struct nm_uid_array *arr;
             rcu_read_lock();
             if ((arr = rcu_dereference(nomount_uids))) {
-                while (start_idx < READ_ONCE(arr->count) && count < (sizeof(payload->buffer) / sizeof(*out)))
+                int signed_n = READ_ONCE(arr->count);
+                u32 n = signed_n > 0 ? (u32)signed_n : 0;
+
+                while (start_idx < n && count < (sizeof(payload->buffer) / sizeof(*out)))
                     out[count++] = arr->uids[start_idx++];
             }
             rcu_read_unlock();            
