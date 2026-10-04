@@ -1,3 +1,30 @@
+// --- Untrusted-input helpers ---
+// App labels, package names and module.prop fields are attacker-controlled: any
+// installed app picks its own label, and `exec` below runs as root. Never
+// interpolate these into HTML or into a shell command without passing them
+// through the helpers here first.
+
+// Escape for use in HTML text or a quoted attribute value.
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"'`=\/]/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+        "'": '&#39;', '`': '&#96;', '=': '&#61;', '/': '&#47;',
+    })[c]);
+}
+
+// A UID is always a non-negative integer. Returns null when it is not.
+function safeUid(value) {
+    const s = String(value ?? '').trim();
+    return /^\d{1,10}$/.test(s) ? s : null;
+}
+
+// Magisk/KernelSU module IDs are [a-zA-Z][a-zA-Z0-9._-]* by spec. Reject
+// anything else rather than pasting it into a root shell command.
+function safeModId(value) {
+    const s = String(value ?? '').trim();
+    return /^[a-zA-Z][a-zA-Z0-9._-]{0,63}$/.test(s) ? s : null;
+}
+
 // KernelSU exec wrapper
 let _cbId = 0;
 function exec(cmd) {
@@ -143,6 +170,17 @@ const NM_DATA = "/data/adb/nomount";
 const NM_BIN = "/data/adb/modules/nomount/bin/nm";
 const FILES = { disable: `${NM_DATA}/disable`, exclusions: `${NM_DATA}/.exclusion_list.json`, isolated: `${NM_DATA}/.block_isolated_uids`, theme: `${NM_DATA}/theme.json` };
 const APP_ICON_FALLBACK = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzgwODA4MCI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6bTAgMThjLTQuNDEgMC04LTMuNTktOC04czMuNTktOCA4LTggOCAzLjU5IDggOC0zLjU5IDgtOCA4eiIvPjwvc3ZnPg==";
+
+// Icon fallback. Registered here instead of an inline `onerror=` attribute so
+// the Content-Security-Policy in index.html can forbid inline script.
+// `error` does not bubble, so listen during the capture phase.
+document.addEventListener('error', (e) => {
+    const el = e.target;
+    if (el instanceof HTMLImageElement && el.classList.contains('app-icon-img')
+        && el.src !== APP_ICON_FALLBACK) {
+        el.src = APP_ICON_FALLBACK;
+    }
+}, true);
 const viewLoadState = { 'view-home': false, 'view-modules': false, 'view-exclusions': false, 'view-options': false };
 
 const renderTextState = (el, cls, text) => { el.className = cls; el.textContent = text; };
@@ -593,10 +631,10 @@ async function loadModules() {
             const isLoaded = fileCount > 0;
             const statusKey = isLoaded ? (hasDisable ? 'status_loaded' : 'status_active') : (hasDisable ? 'status_disabled' : (hasSkipMount ? 'status_skipped' : 'status_inactive'));
             return `
-                <div class="card module-card" data-module-id="${modId}">
+                <div class="card module-card" data-module-id="${escapeHtml(modId)}">
                     <div class="module-header">
                         <div class="module-info">
-                            <h3>${realName || modId}</h3>
+                            <h3>${escapeHtml(realName || modId)}</h3>
                             <div class="module-chips">
                                 <span class="status-chip md-chip status-${statusKey.replace('status_', '')}">
                                     ${translate(statusKey)}
@@ -611,7 +649,7 @@ async function loadModules() {
                                 </span>
                             </div>
                         </div>
-                        <label class="custom-switch" id="switch-${modId}">
+                        <label class="custom-switch" id="switch-${escapeHtml(modId)}">
                             <input type="checkbox" class="switch-input" aria-label="Toggle module" ${!hasDisable ? 'checked' : ''}>
                             <span class="switch-track">
                                 <span class="switch-thumb"></span>
@@ -620,7 +658,7 @@ async function loadModules() {
                     </div>
                     <div class="module-divider"></div>
                     <div class="module-extension">
-                        <button class="btn-hot-action ${isLoaded ? 'unload' : ''}" id="btn-hot-${modId}">
+                        <button class="btn-hot-action ${isLoaded ? 'unload' : ''}" id="btn-hot-${escapeHtml(modId)}">
                             <span>${translate(isLoaded ? 'modules_hot_unload' : 'modules_hot_load')}</span>
                         </button>
                     </div>
@@ -637,7 +675,9 @@ async function loadModules() {
 }
 
 async function loadModule(modId) {
-    const modPath = `${MOD_DIR}/${modId}`;
+    const safeId = safeModId(modId);
+    if (!safeId) throw new Error(`Invalid module id: ${modId}`);
+    const modPath = `${MOD_DIR}/${safeId}`;
     const script = `
         cd "${modPath}" || exit 0
         valid_dirs=""
@@ -676,7 +716,9 @@ async function loadModule(modId) {
 }
 
 async function unloadModule(modId) {
-    const modPath = `${MOD_DIR}/${modId}`;
+    const safeId = safeModId(modId);
+    if (!safeId) throw new Error(`Invalid module id: ${modId}`);
+    const modPath = `${MOD_DIR}/${safeId}`;
     const script = `
         cd "${modPath}" || exit 0
         valid_dirs=""
@@ -745,10 +787,10 @@ async function loadExclusions() {
             const userId = Math.floor(Number(uid) / 100000);
             const userBadge = userId !== 0 ? `<span class="system-chip">User ${userId}</span>` : '';
             return `
-                <div class="card setting-item" data-uid="${uid}" data-label="${label}">
+                <div class="card setting-item" data-uid="${escapeHtml(uid)}" data-label="${escapeHtml(label)}">
                     <div class="exclusion-app">
-                        <img src="ksu://icon/${pkg}" class="app-icon-img" onerror="this.src='${APP_ICON_FALLBACK}'" />
-                        <div class="setting-text"><h3>${label} ${userBadge}</h3><p>${pkg}</p></div>
+                        <img src="ksu://icon/${escapeHtml(pkg)}" class="app-icon-img" />
+                        <div class="setting-text"><h3>${escapeHtml(label)} ${userBadge}</h3><p>${escapeHtml(pkg)}</p></div>
                     </div>
                     <md-icon-button class="btn-delete" aria-label="Remove exclusion">
                         <md-icon data-icon="delete" data-icon-variant="outline" aria-hidden="true">
@@ -974,10 +1016,10 @@ function renderNextAppBatch() {
     const htmlStr = batch.map(app => {
         const isSel = selectedAppsMap.has(app.uid) ? 'selected' : '';
         return `
-        <div class="app-item segment-card ${isSel}" data-uid="${app.uid}" data-label="${app.appLabel}" data-pkg="${app.packageName}">
-            <img src="ksu://icon/${app.packageName}" class="app-icon-img" loading="lazy" onerror="this.src='${APP_ICON_FALLBACK}'" />
-            <div class="app-details"><div class="app-name">${app.appLabel}</div><div class="app-pkg">${app.packageName}</div></div>
-            <div class="app-meta"><div class="uid-label">UID: ${app.uid}</div>${app.isSystem ? '<span class="system-chip">SYS</span>' : ''}${app.isClone ? `<span class="system-chip">User ${app.userId}</span>` : ''}</div>
+        <div class="app-item segment-card ${isSel}" data-uid="${escapeHtml(app.uid)}" data-label="${escapeHtml(app.appLabel)}" data-pkg="${escapeHtml(app.packageName)}">
+            <img src="ksu://icon/${escapeHtml(app.packageName)}" class="app-icon-img" loading="lazy" />
+            <div class="app-details"><div class="app-name">${escapeHtml(app.appLabel)}</div><div class="app-pkg">${escapeHtml(app.packageName)}</div></div>
+            <div class="app-meta"><div class="uid-label">UID: ${escapeHtml(app.uid)}</div>${app.isSystem ? '<span class="system-chip">SYS</span>' : ''}${app.isClone ? `<span class="system-chip">User ${escapeHtml(app.userId)}</span>` : ''}</div>
         </div>
         `;
     }).join('');
@@ -991,7 +1033,9 @@ function renderNextAppBatch() {
 async function removeExclusion(uid, name, domItem) {
     showToast(translate('unblocking_name', { name }));
     try {
-        const unblockResult = await exec(`${NM_BIN} uid del ${uid}`);
+        const safeDelUid = safeUid(uid);
+        if (!safeDelUid) throw new Error(`Invalid UID: ${uid}`);
+        const unblockResult = await exec(`${NM_BIN} uid del ${safeDelUid}`);
         if (unblockResult.errno !== 0) throw new Error(unblockResult.stderr || 'Failed to unblock UID');
         const currentData = await readExclusionsJson();
         const newData = currentData.filter(app => String(app.uid) !== String(uid));
@@ -1008,7 +1052,7 @@ async function removeExclusion(uid, name, domItem) {
 }
 
 async function addExclusion(uid, label, pkg) {
-    const uidStr = String(uid).trim();
+    const uidStr = safeUid(uid);
     if (!uidStr) return showToast(translate('error_blocking'));
 
     try {
@@ -1386,8 +1430,10 @@ function initDelegationAndAttach() {
 
             setTimeout(async () => {
                 try {
-                    if (isChecked) { await exec(`rm ${MOD_DIR}/${modId}/disable`); await loadModule(modId); }
-                    else { await unloadModule(modId); await exec(`touch ${MOD_DIR}/${modId}/disable`); }
+                    const safeId = safeModId(modId);
+                    if (!safeId) throw new Error(`Invalid module id: ${modId}`);
+                    if (isChecked) { await exec(`rm ${MOD_DIR}/${safeId}/disable`); await loadModule(safeId); }
+                    else { await unloadModule(safeId); await exec(`touch ${MOD_DIR}/${safeId}/disable`); }
                     await updateModuleCardDOM(card, modId);
                 } catch (err) {
                     showToast(`Error: ${err.message}`);
@@ -1523,12 +1569,14 @@ function initDelegationAndAttach() {
                     const existingUids = new Set(currentData.map(a => String(a.uid)));
                     let uidsBash = [];
                     appsToSave.forEach((app, uid) => {
+                        const safe = safeUid(uid);
+                        if (!safe) return;
                         if (!existingUids.has(uid)) currentData.push(app);
-                        uidsBash.push(uid);
+                        uidsBash.push(safe);
                     });
 
                     await writeExclusionsJson(currentData);
-                    await exec(`${NM_BIN} uid add ${uidsBash.join(' ')}`);
+                    if (uidsBash.length) await exec(`${NM_BIN} uid add ${uidsBash.join(' ')}`);
                     showToast(`${appsToSave.size} apps added`);
                 } catch { showToast(translate('error_blocking') || 'Error'); }
                 await loadExclusions();

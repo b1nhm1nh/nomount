@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <!-- Defense in depth: this WebView has a root `ksu.exec` bridge, so any
+         injected markup would run as root. Block inline/remote script and
+         restrict loads to this module's own files. Keep in sync with index.js,
+         which escapes untrusted app labels and module.prop fields. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' ksu: data:; font-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=overlays-content">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#fffbff">
