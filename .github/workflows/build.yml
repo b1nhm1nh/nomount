@@ -63,7 +63,12 @@ jobs:
 
       - name: compile lkmloader via zigcc
         run: |
+          # Pinned: this binary is shipped in module/bin and runs as root to load a
+          # kernel module, so an unpinned clone would put whatever is on that
+          # repository HEAD at build time into the release.
+          LKMLOADER_REF=af7fb29222377181220d9814f46b6a8b12cb770c
           git clone https://github.com/maxsteeel/lkmloader.git lkmloader_src
+          git -C lkmloader_src checkout --detach "$LKMLOADER_REF"
           cd lkmloader_src
 
           zig cc -target aarch64-linux -Oz -static -Wl,--gc-sections,-z,norelro -fno-unwind-tables \
